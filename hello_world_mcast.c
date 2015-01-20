@@ -84,7 +84,7 @@ for help run: ./hello_world_mcast -h
 
 #define MAX_POLL_CQ_TIMEOUT 10000 /* poll CQ timeout in milisec */
 #define MSG                 "hello world"
-#define MSG_SIZE            (strlen(MSG) + 1)
+#define MSG_SIZE            (2000)
 #define GRH_SIZE            40
 #define DEF_PKEY_IDX        0
 #define DEF_SL              0
@@ -463,7 +463,7 @@ static int poll_completion(
 		return 1;
 	}
 
-	fprintf(stdout, "completion was found in CQ with status 0x%x\n", wc.status);
+	//fprintf(stdout, "completion was found in CQ with status 0x%x\n", wc.status);
 
 	/* check the completion status (here we don't care about the completion opcode) */
 	if (wc.status != IBV_WC_SUCCESS) {
@@ -512,7 +512,7 @@ static int post_send(
 		fprintf(stderr, "failed to post SR\n");
 		return 1;
 	}
-	fprintf(stdout, "Send Request was posted\n");
+	//fprintf(stdout, "Send Request was posted\n");
 
 	return 0;
 }
@@ -550,7 +550,7 @@ static int post_receive(
 		return 1;
 	}
 
-	fprintf(stdout, "Receive Request was posted\n");
+	//fprintf(stdout, "Receive Request was posted\n");
 
 	return 0;
 }
@@ -658,7 +658,12 @@ static int resources_create(
 
 	/* only in the server side put the message in the memory buffer */
 	if (config.is_server) {
-		strcpy(res->buf, MSG);
+		for(int i=0;i<MSG_SIZE-GRH_SIZE-1;i++)
+		{
+			res->buf[i]=('a'+(i%26));
+		}
+		res->buf[MSG_SIZE-GRH_SIZE-1]=0;
+		//strcpy(res->buf, MSG);
 		fprintf(stdout, "going to send the message: '%s'\n", res->buf);
 	} else
 		memset(res->buf, 0, size);
@@ -1018,9 +1023,23 @@ int str2gid(
 static void usage(const char *argv0)
 {
 	fprintf(stdout, "Usage:\n");
-	fprintf(stdout, "  %s server        join the multicast group and post SR\n", argv0);
-	fprintf(stdout, "  %s client        join the multicast group, attach a QP to it and post RR\n", argv0);
+	fprintf(stdout, "  %s server           start a benchmark server\n", argv0);
+	fprintf(stdout, "  %s client [mode]    start a benchmark client with specific item.\n", argv0);
+	fprintf(stdout, "[mode] can be performance or correctness, please refer to README.\n");
 }
+
+unsigned long currentTimeMillis()
+{
+	struct timeval currentTime;
+	if(gettimeofday(&currentTime, NULL)){
+		fprintf(stderr, "Cannot get current time. \n");
+	}
+	return (currentTime.tv_sec*1000) + (currentTime.tv_usec/1000);
+}
+
+enum benchmark_mode_e { BENCHMARK_MODE_PERFORMANCE, BENCHMARK_MODE_CORRECTNESS };
+
+enum benchmark_mode_e benchmark_mode;
 
 int main(int argc, char* argv[])
 {
@@ -1031,40 +1050,129 @@ int main(int argc, char* argv[])
 	if(!strcmp(argv[1], "server"))
 		config.is_server=1;
 	else if(!strcmp(argv[1], "client"))
+	{
 		config.is_server=0;
+		if(argc<3)
+		{
+			benchmark_mode=BENCHMARK_MODE_PERFORMANCE;
+		}else{
+			if(!strcmp(argv[2],"performance"))
+				benchmark_mode=BENCHMARK_MODE_PERFORMANCE;
+			else if(!strcmp(argv[2],"correctness"))
+				benchmark_mode=BENCHMARK_MODE_CORRECTNESS;
+			else
+			{
+				usage(argv[0]);
+				return 0;
+			}
+		}
+	}
 	else
+	{
 		usage(argv[0]);
+		return 0;
+	}
 	int test_result=1;
 	struct resources res;
-	config.is_server=1;
 	config.dev_name="qib0";
 	print_config();
 	resources_init(&res);
+	unsigned long lastTime=currentTimeMillis();
+	unsigned long totalReceived=0;
 	if(resources_create(&res)){
 		fprintf(stderr,"failed to create resource.\n");
 		goto cleanup;
 	}
+	printf("ACTIVE_MTU: %d\nMAX_MTU: %d\n", res.port_attr.active_mtu, res.port_attr.max_mtu);
 	if(prepare_qps_for_post(&res)){
 		fprintf(stderr,"failed to prepare QP.\n");
 		goto cleanup;
 	}
 	if(config.is_server){
-		if(post_send(&res)){
-			fprintf(stderr,"failed to post SR\n");
-			goto cleanup;
+		while(1)
+		{
+			unsigned long long counter=0;
+			*((unsigned long long*)res.buf)=htonll(counter);
+			if(post_send(&res)){
+				fprintf(stderr,"failed to post SR\n");
+				goto cleanup;
+			}
+			if(poll_completion(&res)){
+				fprintf(stderr, "poll completion failed\n");
+				goto cleanup;
+			}
+			counter++;
 		}
 	}else{
-		if(post_receive(&res)){
-			fprintf(stderr,"failed to post RR\n");
-			goto cleanup;
+		unsigned long long lastCounter=0;
+		unsigned int totalReceived=0;
+		unsigned int badPackage=0;
+		unsigned long lastTime=currentTimeMillis();
+		switch(benchmark_mode)
+		{
+		case BENCHMARK_MODE_PERFORMANCE:
+			while(1)
+			{
+				if(post_receive(&res)){
+					fprintf(stderr,"failed to post RR\n");
+					goto cleanup;
+				}
+				if(poll_completion(&res)){
+					fprintf(stderr, "poll completion failed\n");
+					goto cleanup;
+				}
+				totalReceived+=MSG_SIZE;
+				unsigned long currentTime = currentTimeMillis();
+				if(currentTime - lastTime > 3000)
+				{
+					printf("Data Rate: %lf MB/s.\n", (double)totalReceived/(double)(currentTime-lastTime)/1000.0);
+					totalReceived=0;
+					lastTime=currentTime;
+				}
+			}
+			break;
+		case BENCHMARK_MODE_CORRECTNESS:
+			while(1)
+			{
+				if(post_receive(&res)){
+					fprintf(stderr,"failed to post RR\n");
+					goto cleanup;
+				}
+				if(poll_completion(&res)){
+					fprintf(stderr, "poll completion failed\n");
+					goto cleanup;
+				}
+				totalReceived++;
+				char* buf=res.buf+GRH_SIZE;
+				for(int i=sizeof(unsigned long long); i<MSG_SIZE-GRH_SIZE-1; i++)
+				{
+					if(buf[i]!=('a'+(i%26)))
+					{
+						fprintf(stderr, "Received bad message: %s\n",buf+sizeof(unsigned long long)+100);
+						badPackage++;
+						break;
+					}
+				}
+				unsigned long currentTime = currentTimeMillis();
+				if(currentTime-lastTime>3000)
+				{
+					lastTime=currentTime;
+					printf("Last interval received %lu packages, %lu of them transmission wrong.\n", totalReceived, badPackage);
+					totalReceived=0;
+					badPackage=0;
+				}
+				
+				/*unsigned long long counter=0;
+				counter=ntohll(*(unsigned long long*)buf);
+				if(lastCounter==0)
+				{
+					lastCounter=counter;
+					continue;
+				}*/
+			}
+			break;
 		}
 	}
-	if(poll_completion(&res)){
-		fprintf(stderr, "poll completion failed\n");
-		goto cleanup;
-	}
-	if(!config.is_server)
-		printf("Message is '%s'\n",(res.buf + GRH_SIZE));
 	test_result=0;
 cleanup:
 	if(resources_destroy(&res)){
